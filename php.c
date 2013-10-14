@@ -8,25 +8,26 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include "murmur3.h"
 #include "lua.h"
 #include "lualib.h"
 #include "lauxlib.h"
 
 #define safe_emalloc(nmemb, size, offset)  malloc(nmemb * size + offset)
 
-/* {{{ ctype
- */
-
-#define SUCCESS 0
-
 #define CTYPE(iswhat) \
     size_t str_len; \
     char *p, *e; \
     p = (char *)lua_tolstring(L, 1, &str_len); \
+    if(str_len < 1) \
+    { \
+            lua_pushboolean(L, 0); \
+            return 1; \
+    } \
     e = p + str_len; \
     while (p < e)  \
     { \
-        if(!isalnum((int)*(unsigned char *)(p++))) \
+        if(!iswhat((int)*(unsigned char *)(p++))) \
         { \
             lua_pushboolean(L, 0); \
             return 1; \
@@ -350,7 +351,7 @@ static inline int php_charmask(unsigned char *input, int len, char *mask)
 {
     unsigned char *end;
     unsigned char c;
-    int result = SUCCESS;
+    int result = 0;
 
     memset(mask, 0, 256);
     for (end = input+len; input < end; input++) 
@@ -484,24 +485,66 @@ static int trim(lua_State *L)
     return 1;
 }
 
+static int L_strncmp(lua_State *L)
+{
+    const char *str1 = lua_tostring(L, 1);
+    const char *str2 = lua_tostring(L, 2);
+    lua_Number n     = lua_tonumber(L, 3);
+
+    if(strncmp(str1, str2, n) == 0)
+        lua_pushboolean(L, 1);
+    else
+        lua_pushboolean(L, 0);
+
+    return 1;
+}
+
+
+
+
+static int L_MurmurHash3(lua_State *L)
+{
+    char         hash[128];
+    size_t       len;
+    lua_Integer  n;
+    const char   *key;
+    uint32_t result[4];
+    
+    if(!lua_isstring(L, 1))
+    {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+
+    n      = lua_tointeger(L, 2);
+    key    = lua_tolstring(L, 1, &len);
+    MurmurHash3_x64_128(key, len, n, result);
+    len    = snprintf(hash, 127, "%08x %08x %08x %08x",result[0], result[1], result[2], result[3]); 
+    lua_pushlstring(L, hash, len);
+    return 1;
+}
+
 int luaopen_php(lua_State *L)
 {
     static const luaL_reg php_lib[] = {
-        {"trim",         trim         },
-        {"rtrim",        rtrim        },
-        {"ltrim",        ltrim        },
-        {"split",        split        },
-        {"explode",      explode      },
-        {"ip2long",      ip2long      },
-        {"long2ip",      long2ip      },
-        {"ctype_upper",  ctype_upper  },
-        {"ctype_lower",  ctype_lower  },
-        {"ctype_alpha",  ctype_alpha  },
-        {"ctype_alnum",  ctype_alnum  },
-        {"ctype_lower",  ctype_lower  },
-        {"ctype_digit",  ctype_digit  },
-        {"addslashes",   addslashes   },
-        {"stripslashes", stripslashes },
+        {"trim",         trim          },
+        {"rtrim",        rtrim         },
+        {"ltrim",        ltrim         },
+        {"split",        split         },
+        {"strncmp",      L_strncmp     },
+        {"explode",      explode       },
+        {"ip2long",      ip2long       },
+        {"long2ip",      long2ip       },
+        {"long2ip",      long2ip       },
+        {"MurmurHash3",  L_MurmurHash3 },
+        {"ctype_upper",  ctype_upper   },
+        {"ctype_lower",  ctype_lower   },
+        {"ctype_alpha",  ctype_alpha   },
+        {"ctype_alnum",  ctype_alnum   },
+        {"ctype_lower",  ctype_lower   },
+        {"ctype_digit",  ctype_digit   },
+        {"addslashes",   addslashes    },
+        {"stripslashes", stripslashes  },
         {NULL,        NULL}
     };
 
