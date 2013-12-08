@@ -26,6 +26,13 @@ function print_r ( t )
     sub_print_r(t,"  ")
 end
 
+--local data = php.xxtea_encrypt("olsen", "K9bLgYZB8TsTG3h8");
+--print(data);
+
+print(php.str_pad("Alien", 10, "-=", php.STR_PAD_LEFT));
+
+print("genid=", php.genid());
+print("hash(olsen, 18)=", php.hash("olsen", 18));
 
 local str  = "https:/gist.github.com/nrk/31175";
 local data = php.explode(str, "/");

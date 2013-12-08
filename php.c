@@ -8,10 +8,19 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include "murmur3.h"
+#include "xxtea.h"
 #include "lua.h"
 #include "lualib.h"
 #include "lauxlib.h"
+
+#define emalloc(size)       malloc(size)
+#define ecalloc(count,size) calloc(count,size)
+#define erealloc(ptr,size)  realloc(ptr,size)
+#define efree(ptr)          free(ptr)
+
+#define STR_PAD_LEFT     0
+#define STR_PAD_RIGHT    1
+#define STR_PAD_BOTH     2
 
 #define safe_emalloc(nmemb, size, offset)  malloc(nmemb * size + offset)
 
@@ -37,6 +46,75 @@
     return 1; \
 
 /* }}} */
+
+static __inline__ uint64_t rdtsc(void)
+{
+    unsigned hi, lo;
+    __asm__ __volatile__ ("rdtsc" : "=a"(lo), "=d"(hi));
+    return ( (unsigned long long)lo)|( ((unsigned long long)hi)<<32 );
+}
+
+static xxtea_long *xxtea_to_long_array(unsigned char *data, xxtea_long len, int include_length, xxtea_long *ret_len) {
+    xxtea_long i, n, *result;
+    n = len >> 2;
+    n = (((len & 3) == 0) ? n : n + 1);
+    if (include_length) {
+        result = (xxtea_long *)emalloc((n + 1) << 2);
+        result[n] = len;
+        *ret_len = n + 1;
+    } else {
+        result = (xxtea_long *)emalloc(n << 2);
+        *ret_len = n;
+    }
+    memset(result, 0, n << 2);
+    for (i = 0; i < len; i++) {
+        result[i >> 2] |= (xxtea_long)data[i] << ((i & 3) << 3);
+    }
+    return result;
+}
+
+static unsigned char *xxtea_to_byte_array(xxtea_long *data, xxtea_long len, int include_length, xxtea_long *ret_len) {
+    xxtea_long i, n, m;
+    unsigned char *result;
+    n = len << 2;
+    if (include_length) {
+        m = data[len - 1];
+        if ((m < n - 7) || (m > n - 4)) return NULL;
+        n = m;
+    }
+    result = (unsigned char *)emalloc(n + 1);
+    for (i = 0; i < n; i++) {
+        result[i] = (unsigned char)((data[i >> 2] >> ((i & 3) << 3)) & 0xff);
+    }
+    result[n] = '\0';
+    *ret_len = n;
+    return result;
+}
+
+static unsigned char *php_xxtea_encrypt(unsigned char *data, xxtea_long len, unsigned char *key, xxtea_long *ret_len) {
+    unsigned char *result;
+    xxtea_long *v, *k, v_len, k_len;
+    v = xxtea_to_long_array(data, len, 1, &v_len);
+    k = xxtea_to_long_array(key, 16, 0, &k_len);
+    xxtea_long_encrypt(v, v_len, k);
+    result = xxtea_to_byte_array(v, v_len, 0, ret_len);
+    efree(v);
+    efree(k);
+    return result;
+}
+
+static unsigned char *php_xxtea_decrypt(unsigned char *data, xxtea_long len, unsigned char *key, xxtea_long *ret_len) {
+    unsigned char *result;
+    xxtea_long *v, *k, v_len, k_len;
+    v = xxtea_to_long_array(data, len, 0, &v_len);
+    k = xxtea_to_long_array(key, 16, 0, &k_len);
+    xxtea_long_decrypt(v, v_len, k);
+    result = xxtea_to_byte_array(v, v_len, 1, ret_len);
+    efree(v);
+    efree(k);
+    return result;
+}
+
 
 static inline char *php_memnstr(char *haystack, char *needle, int needle_len, char *end)
 {
@@ -500,15 +578,56 @@ static int L_strncmp(lua_State *L)
 }
 
 
-
-
-static int L_MurmurHash3(lua_State *L)
+static unsigned int GenHashFunction(const void *key, int len, uint32_t seed) 
 {
-    char         hash[128];
-    size_t       len;
-    lua_Integer  n;
+    /* 'm' and 'r' are mixing constants generated offline.
+     They're not really 'magic', they just happen to work well.  */
+  
+    const uint32_t m = 0x5bd1e995;
+    const int r = 24;
+
+    /* Initialize the hash to a 'random' value */
+    uint32_t h = seed ^ len;
+
+    /* Mix 4 bytes at a time into the hash */
+    const unsigned char *data = (const unsigned char *)key;
+
+    while(len >= 4) 
+    {
+        uint32_t k = *(uint32_t*)data;
+
+        k *= m;
+        k ^= k >> r;
+        k *= m;
+
+        h *= m;
+        h ^= k;
+
+        data += 4;
+        len -= 4;
+    }
+
+    /* Handle the last few bytes of the input array  */
+    switch(len) {
+    case 3: h ^= data[2] << 16;
+    case 2: h ^= data[1] << 8;
+    case 1: h ^= data[0]; h *= m;
+    };
+
+    /* Do a few final mixes of the hash to ensure the last few
+     * bytes are well-incorporated. */
+    h ^= h >> 13;
+    h *= m;
+    h ^= h >> 15;
+
+    return (unsigned int)h;
+}
+
+static int L_hash(lua_State *L)
+{
+    unsigned int result;
+    lua_Integer  n, len;
     const char   *key;
-    uint32_t result[4];
     
     if(!lua_isstring(L, 1))
     {
@@ -518,10 +637,147 @@ static int L_MurmurHash3(lua_State *L)
 
     n      = lua_tointeger(L, 2);
     key    = lua_tolstring(L, 1, &len);
-    MurmurHash3_x64_128(key, len, n, result);
-    len    = snprintf(hash, 127, "%08x %08x %08x %08x",result[0], result[1], result[2], result[3]); 
-    lua_pushlstring(L, hash, len);
+    result = GenHashFunction(key, len, n);
+
+    lua_pushinteger(L, result);
     return 1;
+}
+
+static int genid(lua_State *L)
+{
+    char       buf[32];
+    size_t     len, r;
+    uint64_t   tsc;
+
+    tsc = rdtsc();
+
+    memset(buf, 0, 32);
+    srand(tsc);
+
+    r   = rand() % 9+ 0;  
+    len = snprintf(buf, sizeof(buf), "%" PRIu64 "%d", tsc, r);
+    
+
+    lua_pushlstring(L, buf, len);
+    return 1;
+}
+
+static int xxtea_encrypt(lua_State *L)
+{
+    unsigned char *data, *key;
+    unsigned char *result;
+    xxtea_long data_len, key_len, ret_length;
+    
+    data = (unsigned char *)lua_tolstring(L, 1, (size_t *)&data_len);
+    key  = (unsigned char *)lua_tolstring(L, 2, (size_t *)&key_len);
+
+    if(key_len != 16)
+    {
+        lua_pushboolean(L, 0);
+        return 1;
+    }
+    
+    result = php_xxtea_encrypt(data, data_len, key, &ret_length);
+    if (result != NULL) 
+    {
+        lua_pushlstring(L, (char *)result, ret_length);
+        free(result);
+    }
+    else 
+        lua_pushboolean(L, 0);
+
+    return 1;
+}
+
+static int str_pad(lua_State *L)
+{
+size_t  num_pad_chars;   /* Number of padding characters (total - input size) */
+char    *result = NULL;  /* Resulting string */
+int     result_len = 0;  /* Length of the resulting string */
+   
+   int     i, left_pad=0, right_pad=0;
+   
+   const char *input;
+   size_t input_len;
+   long pad_length;
+   
+const char  *pad_str_val = " ";     // Pointer to padding string 
+size_t pad_str_len       = 1;    // Length of the padding string 
+   long   pad_type_val      = STR_PAD_RIGHT; /* The padding type value */
+   
+   input        = lua_tolstring(L, 1, &input_len);
+   pad_length   = lua_tonumber(L, 2);
+   pad_str_val  = lua_tolstring(L, 3, &pad_str_len);
+   pad_type_val = lua_tonumber(L, 4);
+   
+if (pad_length <= 0 || (pad_length - input_len) <= 0) 
+   {
+       lua_pushlstring(L, input, input_len);
+return 1;
+}
+
+if (pad_str_len == 0) 
+   {
+       lua_pushnil(L);
+       lua_pushlstring(L, "Padding string cannot be empty", 30);
+return 1;
+}
+
+if (pad_type_val < STR_PAD_LEFT || pad_type_val > STR_PAD_BOTH) 
+   {    
+       lua_pushnil(L);
+       lua_pushlstring(L, "Padding type has to be STR_PAD_LEFT, STR_PAD_RIGHT, or STR_PAD_BOTH", 67);
+       return 1;
+}
+   
+   
+num_pad_chars = pad_length - input_len;
+if (num_pad_chars >= INT16_MAX) 
+   {
+       lua_pushnil(L);
+       lua_pushlstring(L, "Padding length is too long", 26);
+return 1;
+}
+       
+result = (char *)emalloc(input_len + num_pad_chars + 1);
+
+// We need to figure out the left/right padding lengths.
+switch (pad_type_val) 
+   {
+case STR_PAD_RIGHT:
+left_pad  = 0;
+right_pad = num_pad_chars;
+break;
+
+case STR_PAD_LEFT:
+left_pad  = num_pad_chars;
+right_pad = 0;
+break;
+
+case STR_PAD_BOTH:
+left_pad  = num_pad_chars / 2;
+right_pad = num_pad_chars - left_pad;
+break;
+}
+
+// First we pad on the left. 
+for (i = 0; i < left_pad; i++)
+result[result_len++] = pad_str_val[i % pad_str_len];
+
+// Then we copy the input string. 
+memcpy(result + result_len, input, input_len);
+result_len += input_len;
+
+// Finally, we pad on the right. 
+for (i = 0; i < right_pad; i++)
+result[result_len++] = pad_str_val[i % pad_str_len];
+
+result[result_len] = '\0';
+   
+   lua_pushlstring(L, result, result_len);
+   efree(result);
+   
+   return 1;
 }
 
 int luaopen_php(lua_State *L)
@@ -531,15 +787,18 @@ int luaopen_php(lua_State *L)
         {"rtrim",        rtrim         },
         {"ltrim",        ltrim         },
         {"split",        split         },
+        {"genid",        genid         },
+        {"str_pad",      str_pad       },
+        {"hash",         L_hash        },
         {"strncmp",      L_strncmp     },
         {"explode",      explode       },
         {"ip2long",      ip2long       },
         {"long2ip",      long2ip       },
         {"long2ip",      long2ip       },
-        {"MurmurHash3",  L_MurmurHash3 },
-        {"ctype_upper",  ctype_upper   },
-        {"ctype_lower",  ctype_lower   },
-        {"ctype_alpha",  ctype_alpha   },
+        {"xxtea_encrypt",  xxtea_encrypt },
+        {"ctype_upper",    ctype_upper   },
+        {"ctype_lower",    ctype_lower   },
+        {"ctype_alpha",    ctype_alpha   },
         {"ctype_alnum",  ctype_alnum   },
         {"ctype_lower",  ctype_lower   },
         {"ctype_digit",  ctype_digit   },
@@ -551,5 +810,17 @@ int luaopen_php(lua_State *L)
 
     lua_newtable(L);
     luaL_register(L, NULL, php_lib);
+
+    lua_pushstring(L,"STR_PAD_LEFT");
+    lua_pushnumber(L,STR_PAD_LEFT);
+    lua_settable(L,-3);
+
+    lua_pushstring(L,"STR_PAD_RIGHT");
+    lua_pushnumber(L,STR_PAD_RIGHT);
+    lua_settable(L,-3);
+
+    lua_pushstring(L,"STR_PAD_BOTH");
+    lua_pushnumber(L,STR_PAD_BOTH);
+    lua_settable(L,-3);
     return 1;
 }
