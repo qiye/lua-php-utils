@@ -24,15 +24,16 @@ PHP-style utility functions for LuaJIT applications
 1. ctype_lower
 1. ctype_digit
 1. addslashes
-1. stripslashes
+1. stripslashesa
+1. xxtea_decrypt
+1. xxtea_encrypt
 
 
 编译方法
 -------------
 <pre>
 gcc -O3 -shared -fPIC -I/usr/local/include/luajit-2.0/   -c -o php.o php.c
-gcc -O3 -shared -fPIC -I/usr/local/include/luajit-2.0/   -c -o xxtea.o xxtea.c
-gcc -O3 -shared -fPIC -I/usr/local/include/luajit-2.0/ -ansi -pedantic -Wall -o php.so php.o xxtea.o
+gcc -O3 -shared -fPIC -I/usr/local/include/luajit-2.0/ -ansi -pedantic -Wall -o php.so php.o
 </pre>
 
 运行例子程序
