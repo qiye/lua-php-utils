@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <ctype.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -183,7 +184,7 @@ static int split(lua_State *L)
     delim   = lua_tostring(L, 2);
     limit   = (lua_isnumber(L, 3) == 1) ? lua_tointeger(L, 3) : LONG_MAX;
 
-    spliton =  strndup(str, str_len);
+    spliton =  strdupa(str);
 
     lua_newtable(L); 
     do {
@@ -197,8 +198,8 @@ static int split(lua_State *L)
         }
     } while(token && count < limit);
 
-    free(spliton);
-    spliton = NULL;
+    //free(spliton);
+    //spliton = NULL;
     return 1;
 }
 
