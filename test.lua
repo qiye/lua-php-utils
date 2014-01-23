@@ -26,6 +26,8 @@ function print_r ( t )
     sub_print_r(t,"  ")
 end
 
+print(php.ctype_upper("^&("));
+--[[
 local data = php.xxtea_encrypt("olsen", "abcd1234abcd1234");
 --print(data);
 local str = php.xxtea_decrypt(data, "abcd1234abcd1234");
@@ -67,3 +69,5 @@ end
 
 print("trim");
 print(php.trim(" dasd 解决 "));
+
+--]]

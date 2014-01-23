@@ -27,6 +27,11 @@
 #define CTYPE(iswhat) \
     size_t str_len; \
     char *p, *e; \
+    if(!lua_isstring(L, 1)) \
+    { \
+            lua_pushboolean(L, 0); \
+            return 1; \
+    } \
     p = (char *)lua_tolstring(L, 1, &str_len); \
     if(str_len < 1) \
     { \
@@ -362,6 +367,11 @@ static int ctype_lower(lua_State *L)
 static int ctype_upper(lua_State *L)
 {
     CTYPE(isupper)
+}
+
+static int ctype_punct(lua_State *L)
+{
+    CTYPE(ispunct)
 }
 
 static inline int php_charmask(unsigned char *input, int len, char *mask)
@@ -937,6 +947,7 @@ int luaopen_php(lua_State *L)
         {"ctype_alnum",    ctype_alnum   },
         {"ctype_lower",    ctype_lower   },
         {"ctype_digit",    ctype_digit   },
+        {"ctype_punct",    ctype_punct   },
         {"addslashes",     addslashes    },
         {"stripslashes",   stripslashes  },
         {NULL,             NULL          }
