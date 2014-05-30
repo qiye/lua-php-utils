@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <math.h>
 #include <ctype.h>
 #include <stdio.h>
 #include <stdint.h>
@@ -9,9 +10,20 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <openssl/evp.h>
+#include <openssl/bio.h>
+#include <openssl/rand.h>
 #include "lua.h"
 #include "lualib.h"
 #include "lauxlib.h"
+
+
+/*
+
+gcc -o php.o -O2  -fPIC -I/usr/local/include/luajit-2.0/ -I/usr/local/openssl/include  -c php.c
+gcc -O2 -o php.so php.o -shared -Wl,--rpath=/usr/local/openssl/lib -L/usr/local/openssl/lib -lcrypto -ansi -ldl -lm -pedantic   
+
+*/
 
 #define emalloc(size)       malloc(size)
 #define ecalloc(count,size) calloc(count,size)
@@ -21,6 +33,8 @@
 #define STR_PAD_LEFT     0
 #define STR_PAD_RIGHT    1
 #define STR_PAD_BOTH     2
+
+#define ITERATION 1000000
 
 #define safe_emalloc(nmemb, size, offset)  malloc(nmemb * size + offset)
 
@@ -924,32 +938,163 @@ result[result_len] = '\0';
    return 1;
 }
 
+static int base64_encode(const char *message, char **buffer) 
+{
+    BIO *bio, *b64;
+    FILE* stream;
+
+    int encodedSize = 4*ceil((double)strlen(message)/3);
+    
+    *buffer = (char *)malloc(encodedSize+1);
+    stream  = fmemopen(*buffer, encodedSize+1, "w");
+    b64     = BIO_new(BIO_f_base64());
+    bio     = BIO_new_fp(stream, BIO_NOCLOSE);
+    bio     = BIO_push(b64, bio);
+    
+    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+    BIO_write(bio, message, strlen(message));
+    BIO_flush(bio);
+    BIO_free_all(bio);
+    fclose(stream);
+    return 0;
+}
+
+static int calc_decode_length(const char *b64input) 
+{
+    int len = strlen(b64input);
+    int padding = 0;
+    if (b64input[len-1] == '=' && b64input[len-2] == '=') 
+    {
+        padding = 2;
+    } 
+    else if (b64input[len-1] == '=') 
+    { 
+        padding = 1;
+    }
+    return (int)len*0.75 - padding;
+}
+
+static int base64_decode(char *b64message, char **buffer) 
+{
+   BIO *bio, *b64;
+   
+   int decodeLen = calc_decode_length(b64message),len = 0;
+   *buffer = (char*)malloc(decodeLen+1);
+   FILE* stream = fmemopen(b64message, strlen(b64message), "r");
+   
+   b64 = BIO_new(BIO_f_base64());
+   bio = BIO_new_fp(stream, BIO_NOCLOSE);
+   bio = BIO_push(b64, bio);
+   BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
+   len = BIO_read(bio, *buffer, strlen(b64message));
+   (*buffer)[len] = '\0';
+   BIO_free_all(bio);
+   fclose(stream);
+   return 0;
+}
+
+static int openssl_encrypt(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *method, unsigned char *key, unsigned char *iv, const char *message, unsigned char **cipher, unsigned int cipher_len) 
+{
+    unsigned int out_len = 0;
+    
+    EVP_CIPHER_CTX_init(ctx);
+    EVP_EncryptInit_ex(ctx,method,NULL,(unsigned char *)key, iv);
+    EVP_EncryptUpdate(ctx,(unsigned char *)*cipher,&cipher_len,(unsigned char *)message,strlen(message));
+    EVP_EncryptFinal_ex(ctx,(unsigned char *)(*cipher+cipher_len),&out_len);
+    EVP_CIPHER_CTX_cleanup(ctx);
+    
+    return 0;
+}
+
+static int openssl_decrypt(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *method, unsigned char *key, unsigned char *iv, char *dectext, unsigned char **plain, unsigned int plain_len) 
+{
+   unsigned int out_len=0;
+   EVP_CIPHER_CTX_init(ctx);
+   EVP_DecryptInit_ex(ctx,method,NULL,(unsigned char *)key,iv);
+   EVP_DecryptUpdate(ctx,(unsigned char *)*plain,&plain_len,(unsigned char *)dectext,strlen(dectext));
+   EVP_DecryptFinal_ex(ctx,(unsigned char *)(*plain+plain_len),&out_len);
+   EVP_CIPHER_CTX_cleanup(ctx);
+   return 0;
+}
+
+
+static int des_ecb_encrypt(lua_State *L)
+{
+    char *enctext;
+    EVP_CIPHER_CTX ctx;
+    unsigned char *cipher, *key, *message;
+    size_t cipher_len, message_len, key_len;
+
+
+    message   = (unsigned char *)lua_tolstring(L, 1, &message_len);
+    key       = (unsigned char *)lua_tolstring(L, 2, &key_len);
+
+
+    cipher_len = message_len+EVP_MAX_BLOCK_LENGTH;
+    cipher     = (unsigned char *)calloc(cipher_len,sizeof(char));
+    openssl_encrypt(&ctx, EVP_des_ecb(), key, NULL, message, &cipher, cipher_len);
+    base64_encode( (const char *)cipher, &enctext ); 
+    lua_pushstring(L, enctext);
+
+    free(cipher);
+    free(enctext);
+    cipher  = NULL;
+    enctext = NULL;
+    return 1;
+}
+
+static int des_ecb_decrypt(lua_State *L)
+{
+    EVP_CIPHER_CTX ctx;
+    unsigned char *key, *plain;
+    size_t plain_len, dectext_len, key_len;
+    char *enctext, *dectext;
+
+    enctext   = (char *)lua_tolstring(L, 1, &dectext_len);
+    key       = (unsigned char *)lua_tolstring(L, 2, &key_len);
+
+    base64_decode(enctext, &dectext);
+    plain_len = strlen(dectext)+EVP_MAX_BLOCK_LENGTH;
+    plain     = (unsigned char *)calloc(plain_len,sizeof(char));
+    openssl_decrypt(&ctx, EVP_des_ecb(), key, NULL, dectext, &plain, plain_len); 
+
+    lua_pushstring(L, plain);
+
+    free(plain);
+    free(dectext);
+    plain   = NULL;
+    dectext = NULL;
+    return 1;
+}
+
 int luaopen_php(lua_State *L)
 {
     static const luaL_reg php_lib[] = {
-        {"trim",           trim          },
-        {"rtrim",          rtrim         },
-        {"ltrim",          ltrim         },
-        {"split",          split         },
-        {"genid",          genid         },
-        {"str_pad",        str_pad       },
-        {"hash",           L_hash        },
-        {"strncmp",        L_strncmp     },
-        {"explode",        explode       },
-        {"ip2long",        ip2long       },
-        {"long2ip",        long2ip       },
-        {"long2ip",        long2ip       },
-        {"xxtea_decrypt",  xxtea_decrypt },
-        {"xxtea_encrypt",  xxtea_encrypt },
-        {"ctype_upper",    ctype_upper   },
-        {"ctype_lower",    ctype_lower   },
-        {"ctype_alpha",    ctype_alpha   },
-        {"ctype_alnum",    ctype_alnum   },
-        {"ctype_lower",    ctype_lower   },
-        {"ctype_digit",    ctype_digit   },
-        {"ctype_punct",    ctype_punct   },
-        {"addslashes",     addslashes    },
-        {"stripslashes",   stripslashes  },
+        {"trim",            trim          },
+        {"rtrim",           rtrim         },
+        {"ltrim",           ltrim         },
+        {"split",           split         },
+        {"genid",           genid         },
+        {"str_pad",         str_pad       },
+        {"hash",            L_hash        },
+        {"strncmp",         L_strncmp     },
+        {"explode",         explode       },
+        {"ip2long",         ip2long       },
+        {"long2ip",         long2ip       },
+        {"long2ip",         long2ip       },
+        {"xxtea_decrypt",   xxtea_decrypt },
+        {"xxtea_encrypt",   xxtea_encrypt },
+        {"ctype_upper",     ctype_upper   },
+        {"ctype_lower",     ctype_lower   },
+        {"ctype_alpha",     ctype_alpha   },
+        {"ctype_alnum",     ctype_alnum   },
+        {"ctype_lower",     ctype_lower   },
+        {"ctype_digit",     ctype_digit   },
+        {"ctype_punct",     ctype_punct   },
+        {"addslashes",      addslashes    },
+        {"stripslashes",    stripslashes  },
+        {"des_ecb_encrypt", des_ecb_encrypt  },
+        {"des_ecb_decrypt", des_ecb_decrypt  },
         {NULL,             NULL          }
     };
 
@@ -970,3 +1115,4 @@ int luaopen_php(lua_State *L)
     lua_settable(L,-3);
     return 1;
 }
+
