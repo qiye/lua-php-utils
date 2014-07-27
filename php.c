@@ -6,13 +6,11 @@
 #include <stdlib.h>
 #include <stddef.h>
 #include <string.h>
+#include <mcrypt.h>
 #include <inttypes.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
-#include <openssl/evp.h>
-#include <openssl/bio.h>
-#include <openssl/rand.h>
 #include "lua.h"
 #include "lualib.h"
 #include "lauxlib.h"
@@ -20,8 +18,8 @@
 
 /*
 
-gcc -o php.o -O2  -fPIC -I/usr/local/include/luajit-2.0/ -I/usr/local/openssl/include  -c php.c
-gcc -O2 -o php.so php.o -shared -Wl,--rpath=/usr/local/openssl/lib -L/usr/local/openssl/lib -lcrypto -ansi -ldl -lm -pedantic   
+gcc -o php.o -O2  -fPIC -I/usr/local/include/luajit-2.0/ -I/usr/local/libmcrypt/include   -c php.c
+gcc -O2 -o php.so php.o -shared -Wl,--rpath=/usr/local/openssl/lib -L/usr/local/libmcrypt/lib -lmcrypt -ansi -ldl -lm -pedantic   
 
 */
 
@@ -29,6 +27,9 @@ gcc -O2 -o php.so php.o -shared -Wl,--rpath=/usr/local/openssl/lib -L/usr/local/
 #define ecalloc(count,size) calloc(count,size)
 #define erealloc(ptr,size)  realloc(ptr,size)
 #define efree(ptr)          free(ptr)
+#define MCRYPT_ENCRYPT 0
+#define MCRYPT_DECRYPT 1
+#define MIN(X,Y) ((X) < (Y) ? (X) : (Y))
 
 #define STR_PAD_LEFT     0
 #define STR_PAD_RIGHT    1
@@ -938,134 +939,169 @@ result[result_len] = '\0';
    return 1;
 }
 
-static int base64_encode(const char *message, char **buffer) 
-{
-    BIO *bio, *b64;
-    FILE* stream;
 
-    int encodedSize = 4*ceil((double)strlen(message)/3);
-    
-    *buffer = (char *)malloc(encodedSize+1);
-    stream  = fmemopen(*buffer, encodedSize+1, "w");
-    b64     = BIO_new(BIO_f_base64());
-    bio     = BIO_new_fp(stream, BIO_NOCLOSE);
-    bio     = BIO_push(b64, bio);
-    
-    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-    BIO_write(bio, message, strlen(message));
-    BIO_flush(bio);
-    BIO_free_all(bio);
-    fclose(stream);
-    return 0;
-}
 
-static int calc_decode_length(const char *b64input) 
+static int php_mcrypt_do_crypt(lua_State *L, char* cipher, const char *key, int key_len, const char *data, int data_len, char *mode, const char *iv, int iv_len, int argc, int dencrypt) /* {{{ */
 {
-    int len = strlen(b64input);
-    int padding = 0;
-    if (b64input[len-1] == '=' && b64input[len-2] == '=') 
+    int block_size, max_key_length, use_key_length, i, count, iv_size;
+    unsigned long int data_size;
+    int *key_length_sizes;
+    char *key_s = NULL, *iv_s;
+    char *data_s;
+    MCRYPT td;
+
+
+    td = mcrypt_module_open(cipher, NULL, mode, NULL);
+    if (td == MCRYPT_FAILED) 
     {
-        padding = 2;
-    } 
-    else if (b64input[len-1] == '=') 
-    { 
-        padding = 1;
+        //php_error_docref(NULL TSRMLS_CC, E_WARNING, MCRYPT_OPEN_MODULE_FAILED);
+        //RETURN_FALSE;
+        return 1;
     }
-    return (int)len*0.75 - padding;
-}
-
-static int base64_decode(char *b64message, char **buffer) 
-{
-   BIO *bio, *b64;
-   
-   int decodeLen = calc_decode_length(b64message),len = 0;
-   *buffer = (char*)malloc(decodeLen+1);
-   FILE* stream = fmemopen(b64message, strlen(b64message), "r");
-   
-   b64 = BIO_new(BIO_f_base64());
-   bio = BIO_new_fp(stream, BIO_NOCLOSE);
-   bio = BIO_push(b64, bio);
-   BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-   len = BIO_read(bio, *buffer, strlen(b64message));
-   (*buffer)[len] = '\0';
-   BIO_free_all(bio);
-   fclose(stream);
-   return 0;
-}
-
-static int openssl_encrypt(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *method, unsigned char *key, unsigned char *iv, const char *message, unsigned char **cipher, unsigned int cipher_len) 
-{
-    unsigned int out_len = 0;
+    /* Checking for key-length */
+    max_key_length = mcrypt_enc_get_key_size(td);
+    if (key_len > max_key_length) 
+    {
+        lua_pushstring (L, "Size of key is too large for this algorithm");
+        lua_error(L);
+        return 1;
+        //php_error_docref(NULL TSRMLS_CC, E_WARNING, "Size of key is too large for this algorithm");
+    }
+    key_length_sizes = mcrypt_enc_get_supported_key_sizes(td, &count);
+    if (count == 0 && key_length_sizes == NULL) { /* all lengths 1 - k_l_s = OK */
+        use_key_length = key_len;
+        key_s = emalloc(use_key_length);
+        memset(key_s, 0, use_key_length);
+        memcpy(key_s, key, use_key_length);
+    } 
+    else if (count == 1) {  /* only m_k_l = OK */
+        key_s = emalloc(key_length_sizes[0]);
+        memset(key_s, 0, key_length_sizes[0]);
+        memcpy(key_s, key, MIN(key_len, key_length_sizes[0]));
+        use_key_length = key_length_sizes[0];
+    } 
+    else 
+    { /* dertermine smallest supported key > length of requested key */
+        use_key_length = max_key_length; /* start with max key length */
+        for (i = 0; i < count; i++) {
+            if (key_length_sizes[i] >= key_len && 
+                key_length_sizes[i] < use_key_length)
+            {
+                use_key_length = key_length_sizes[i];
+            }
+        }
+        key_s = emalloc(use_key_length);
+        memset(key_s, 0, use_key_length);
+        memcpy(key_s, key, MIN(key_len, use_key_length));
+    }
+    mcrypt_free (key_length_sizes);
     
-    EVP_CIPHER_CTX_init(ctx);
-    EVP_EncryptInit_ex(ctx,method,NULL,(unsigned char *)key, iv);
-    EVP_EncryptUpdate(ctx,(unsigned char *)*cipher,&cipher_len,(unsigned char *)message,strlen(message));
-    EVP_EncryptFinal_ex(ctx,(unsigned char *)(*cipher+cipher_len),&out_len);
-    EVP_CIPHER_CTX_cleanup(ctx);
+    /* Check IV */
+    iv_s = NULL;
+    iv_size = mcrypt_enc_get_iv_size (td);
     
-    return 0;
-}
+    /* IV is required */
+    if (mcrypt_enc_mode_has_iv(td) == 1) {
+        if (argc == 5) {
+            if (iv_size != iv_len) {
+                //php_error_docref(NULL TSRMLS_CC, E_WARNING, MCRYPT_IV_WRONG_SIZE);
+            } else {
+                iv_s = emalloc(iv_size + 1);
+                memcpy(iv_s, iv, iv_size);
+            }
+        } else if (argc == 4) {
+            //php_error_docref(NULL TSRMLS_CC, E_WARNING, "Attempt to use an empty IV, which is NOT recommend");
+            iv_s = emalloc(iv_size + 1);
+            memset(iv_s, 0, iv_size + 1);
+        }
+    }
 
-static int openssl_decrypt(EVP_CIPHER_CTX *ctx, const EVP_CIPHER *method, unsigned char *key, unsigned char *iv, char *dectext, unsigned char **plain, unsigned int plain_len) 
-{
-   unsigned int out_len=0;
-   EVP_CIPHER_CTX_init(ctx);
-   EVP_DecryptInit_ex(ctx,method,NULL,(unsigned char *)key,iv);
-   EVP_DecryptUpdate(ctx,(unsigned char *)*plain,&plain_len,(unsigned char *)dectext,strlen(dectext));
-   EVP_DecryptFinal_ex(ctx,(unsigned char *)(*plain+plain_len),&out_len);
-   EVP_CIPHER_CTX_cleanup(ctx);
-   return 0;
-}
+    /* Check blocksize */
+    if (mcrypt_enc_is_block_mode(td) == 1) { /* It's a block algorithm */
+        block_size = mcrypt_enc_get_block_size(td);
+        data_size = (((data_len - 1) / block_size) + 1) * block_size;
+        data_s = emalloc(data_size);
+        memset(data_s, 0, data_size);
+        memcpy(data_s, data, data_len);
+    } else { /* It's not a block algorithm */
+        data_size = data_len;
+        data_s = emalloc(data_size);
+        memset(data_s, 0, data_size);
+        memcpy(data_s, data, data_len);
+    }
 
+    if (mcrypt_generic_init(td, key_s, use_key_length, iv_s) < 0) 
+    {
+        lua_pushstring (L, "Mcrypt initialisation failed");
+        lua_error(L);
+        return 1;
+    }
+    if (dencrypt == MCRYPT_ENCRYPT) 
+    {
+        mcrypt_generic(td, data_s, data_size);
+    } 
+    else 
+    {
+        mdecrypt_generic(td, data_s, data_size);
+    }
+    
+    //RETVAL_STRINGL(data_s, data_size, 1);
+    lua_pushlstring(L, data_s, data_size);
+    
+    /* freeing vars */
+    mcrypt_generic_end(td);
+    if (key_s != NULL) 
+    {
+        efree (key_s);
+    }
+    if (iv_s != NULL) 
+    {
+        efree (iv_s);
+    }
+    efree (data_s);
 
-static int des_ecb_encrypt(lua_State *L)
-{
-    char *enctext;
-    EVP_CIPHER_CTX ctx;
-    unsigned char *cipher, *key, *message;
-    size_t cipher_len, message_len, key_len;
-
-
-    message   = (unsigned char *)lua_tolstring(L, 1, &message_len);
-    key       = (unsigned char *)lua_tolstring(L, 2, &key_len);
-
-
-    cipher_len = message_len+EVP_MAX_BLOCK_LENGTH;
-    cipher     = (unsigned char *)calloc(cipher_len,sizeof(char));
-    openssl_encrypt(&ctx, EVP_des_ecb(), key, NULL, message, &cipher, cipher_len);
-    base64_encode( (const char *)cipher, &enctext ); 
-    lua_pushstring(L, enctext);
-
-    free(cipher);
-    free(enctext);
-    cipher  = NULL;
-    enctext = NULL;
     return 1;
 }
 
-static int des_ecb_decrypt(lua_State *L)
+static int mcrypt_encrypt(lua_State *L)
 {
-    EVP_CIPHER_CTX ctx;
-    unsigned char *key, *plain;
-    size_t plain_len, dectext_len, key_len;
-    char *enctext, *dectext;
+    char *key, *text, *iv   = NULL;
+    size_t key_len, text_len;
+    int iv_len = 0;
+    
+    key   = lua_tolstring(L, 1, &key_len);
+    text  = lua_tolstring(L, 2, &text_len);
 
-    enctext   = (char *)lua_tolstring(L, 1, &dectext_len);
-    key       = (unsigned char *)lua_tolstring(L, 2, &key_len);
-
-    base64_decode(enctext, &dectext);
-    plain_len = strlen(dectext)+EVP_MAX_BLOCK_LENGTH;
-    plain     = (unsigned char *)calloc(plain_len,sizeof(char));
-    openssl_decrypt(&ctx, EVP_des_ecb(), key, NULL, dectext, &plain, plain_len); 
-
-    lua_pushstring(L, plain);
-
-    free(plain);
-    free(dectext);
-    plain   = NULL;
-    dectext = NULL;
+    
+    php_mcrypt_do_crypt(L, MCRYPT_DES, key, key_len, text, text_len, MCRYPT_ECB, iv, iv_len, 3, MCRYPT_ENCRYPT);
+    //lua_pushlstring(L, data_s, data_size);
     return 1;
 }
+
+static int mcrypt_get_block_size(lua_State *L)
+{
+    MCRYPT td;
+    char *cipher;
+    char *module;
+
+    cipher   = lua_tostring(L, 1);
+    module   = lua_tostring(L, 2);
+
+    td = mcrypt_module_open(cipher, NULL, module, NULL);
+    if (td != MCRYPT_FAILED) 
+    {
+        lua_pushnumber(L, mcrypt_enc_get_block_size(td));
+        mcrypt_module_close(td);
+    } 
+    else 
+    {
+        lua_pushstring (L, "Mcrypt initialisation failed");
+        lua_error(L);
+        lua_pushboolean (L, 0);
+    }
+    return 1;
+}
+
 
 int luaopen_php(lua_State *L)
 {
@@ -1093,8 +1129,8 @@ int luaopen_php(lua_State *L)
         {"ctype_punct",     ctype_punct   },
         {"addslashes",      addslashes    },
         {"stripslashes",    stripslashes  },
-        {"des_ecb_encrypt", des_ecb_encrypt  },
-        {"des_ecb_decrypt", des_ecb_decrypt  },
+        {"mcrypt_encrypt",  mcrypt_encrypt  },
+        {"mcrypt_get_block_size", mcrypt_get_block_size  },
         {NULL,             NULL          }
     };
 
